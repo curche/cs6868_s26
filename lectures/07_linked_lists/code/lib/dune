@@ -19,17 +19,18 @@
  (modules lazy_list))
 
 (library
+ (name atomic_intf)
+ (modules atomic_intf))
+
+(library
  (name atomic_markable_ref)
+ (libraries atomic_intf)
  (modules atomic_markable_ref))
 
 (library
  (name lockfree_list)
- (libraries atomic_markable_ref)
+ (libraries atomic_intf atomic_markable_ref)
  (modules lockfree_list))
- (library
- (name buggy_lockfree_list)
- (libraries atomic_markable_ref lockfree_list)
- (modules buggy_lockfree_list))
 
 (library
  (name lazy_list_racefree)
