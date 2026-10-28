@@ -101,9 +101,9 @@
 (executable
  (name dscheck_lockfree_stack)
  (modules dscheck_lockfree_stack)
- (libraries lockfree_stack dscheck))
+ (libraries lockfree_stack backoff dscheck))
 
 (executable
- (name dscheck_lockfree_stack_usingBuiltinlist)
- (modules dscheck_lockfree_stack_usingBuiltinlist)
- (libraries lockfree_stack_builtin_list dscheck))
+ (name dscheck_lockfree_stack_builtin_list)
+ (modules dscheck_lockfree_stack_builtin_list)
+ (libraries lockfree_stack_builtin_list backoff dscheck))

@@ -1,187 +1,139 @@
-(** DSCheck tests for Treiber Stack over the imoplementation provided for lockFreestack*)
-(* Here we are using pointer based approach for representing stack.
-  type 'a node = {
-    value : 'a;
-    next  : 'a node option;
-  }
+(** DSCheck tests for the Treiber stack ([Lockfree_stack]).
 
-*)
+    DSCheck can only explore interleavings of atomic operations it can
+    see, so the stack under test is [Lockfree_stack.Make] instantiated
+    with [Dscheck.TracedAtomic]: every read and CAS on [top] inside [push]
+    and [try_pop] becomes a scheduling point.  Backoff is disabled because
+    model checking needs deterministic runs.  [Atomic.trace] runs the test
+    body once for every (non-equivalent) interleaving of the spawned
+    threads, and [Atomic.check] fails if the property is violated in any
+    of them, printing the offending interleaving. *)
+
 module Atomic = Dscheck.TracedAtomic
-module Stack = Lockfree_stack
 
-(* ------------------------------------------------------------------ *)
-(* Test 1 : two concurrent pushes                                     *)
-(* Here we spawning two threads and doing concurrent pushes.
-Now final stack should have either a,b or b,a as final state, we are checking property that no value
-is lost in lockfree stack, means the implementation doesn't have any race condition. *)
-(* ------------------------------------------------------------------ *)
+module Tests (Stack : Lockfree_stack.S) = struct
+  (* Pop everything left on the stack, top first. *)
+  let drain s =
+    let rec loop acc =
+      match Stack.try_pop s with
+      | Some x -> loop (x :: acc)
+      | None -> List.rev acc
+    in
+    loop []
 
-let two_pushes () =
-  Atomic.trace (fun () ->
-    let s = Stack.create () in
+  (* Test 1: two concurrent pushes.  Neither value is lost. *)
+  let two_pushes () =
+    Atomic.trace (fun () ->
+      let s = Stack.create () in
+      Atomic.spawn (fun () -> Stack.push s 1);
+      Atomic.spawn (fun () -> Stack.push s 2);
+      Atomic.final (fun () ->
+        Atomic.check (fun () ->
+          List.sort compare (drain s) = [ 1; 2 ])))
 
-    Atomic.spawn (fun () -> Stack.push s 1);
-    Atomic.spawn (fun () -> Stack.push s 2);
+  (* Test 2: a push racing with a pop on an empty stack.
+     Two valid linearizations:
+       pop first  -> pop returns None,    42 is left on the stack
+       push first -> pop returns Some 42, the stack ends empty *)
+  let push_and_pop () =
+    Atomic.trace (fun () ->
+      let s = Stack.create () in
+      let popped = Atomic.make None in
+      Atomic.spawn (fun () -> Stack.push s 42);
+      Atomic.spawn (fun () -> Atomic.set popped (Stack.try_pop s));
+      Atomic.final (fun () ->
+        Atomic.check (fun () ->
+          match Atomic.get popped, drain s with
+          | None, [ 42 ] | Some 42, [] -> true
+          | _ -> false)))
 
-    Atomic.final (fun () ->
-      Atomic.check (fun () ->
-        let r1 = Stack.try_pop s in
-        let r2 = Stack.try_pop s in
-        let r3 = Stack.try_pop s in
+  (* Test 3: two concurrent pops on a two-element stack.
+     Each pop gets a distinct element and the stack ends empty. *)
+  let two_pops () =
+    Atomic.trace (fun () ->
+      let s = Stack.create () in
+      Stack.push s 1;
+      Stack.push s 2;
+      let r1 = Atomic.make None in
+      let r2 = Atomic.make None in
+      Atomic.spawn (fun () -> Atomic.set r1 (Stack.try_pop s));
+      Atomic.spawn (fun () -> Atomic.set r2 (Stack.try_pop s));
+      Atomic.final (fun () ->
+        Atomic.check (fun () ->
+          match Atomic.get r1, Atomic.get r2 with
+          | Some a, Some b -> List.sort compare [ a; b ] = [ 1; 2 ] && drain s = []
+          | _ -> false)))
 
-        match r1, r2, r3 with
-        | Some a, Some b, None -> List.sort compare [ a; b ] = [ 1; 2 ]
-        | _ -> false)))
-;;
+  (* Test 4: LIFO order under a push/pop race.
+     Starting from [2; 1] (2 on top), one thread pushes 3 while another
+     pops.  The pop takes whichever element is on top at its CAS:
+       pop first  -> pops 2, stack ends [3; 1]
+       push first -> pops 3, stack ends [2; 1]
+     Element 1, at the bottom, can never be popped. *)
+  let lifo () =
+    Atomic.trace (fun () ->
+      let s = Stack.create () in
+      Stack.push s 1;
+      Stack.push s 2;
+      let popped = Atomic.make None in
+      Atomic.spawn (fun () -> Stack.push s 3);
+      Atomic.spawn (fun () -> Atomic.set popped (Stack.try_pop s));
+      Atomic.final (fun () ->
+        Atomic.check (fun () ->
+          match Atomic.get popped, drain s with
+          | Some 2, [ 3; 1 ] | Some 3, [ 2; 1 ] -> true
+          | _ -> false)))
 
-(* ------------------------------------------------------------------ *)
-(* Test 2 : push/pop race                                             *)
-(* ------------------------------------------------------------------ *)
+  (* Test 5: conservation — elements are neither lost nor duplicated.
+     Two pushes race with two pops; whatever the pops returned plus
+     whatever is left on the stack is exactly {1, 2}. *)
+  let conservation () =
+    Atomic.trace (fun () ->
+      let s = Stack.create () in
+      let r1 = Atomic.make None in
+      let r2 = Atomic.make None in
+      Atomic.spawn (fun () -> Stack.push s 1);
+      Atomic.spawn (fun () -> Stack.push s 2);
+      Atomic.spawn (fun () -> Atomic.set r1 (Stack.try_pop s));
+      Atomic.spawn (fun () -> Atomic.set r2 (Stack.try_pop s));
+      Atomic.final (fun () ->
+        Atomic.check (fun () ->
+          let popped = List.filter_map Fun.id [ Atomic.get r1; Atomic.get r2 ] in
+          List.sort compare (popped @ drain s) = [ 1; 2 ])))
+end
 
-let push_and_pop () =
-  Atomic.trace (fun () ->
-    let s = Stack.create () in
-    let popped = Atomic.make None in
+module T = Tests (Lockfree_stack.Make (Atomic) (Backoff.No_backoff))
 
-    Atomic.spawn (fun () ->Stack.push s 42);
+(* Negative test: the same stack built on a CAS that is NOT atomic (a read
+   followed by a separate write).  Two pushes can then both read the same
+   [top] and one of them is lost.  DSCheck must find that interleaving; if
+   it does not, the tests above are not exploring the stack's internals. *)
+module Racy_cas = struct
+  include Atomic
 
-    Atomic.spawn (fun () ->
-      Atomic.set popped (Stack.try_pop s));
+  let compare_and_set r seen v =
+    if get r == seen then (set r v; true) else false
+end
 
-    Atomic.final (fun () ->
-      Atomic.check (fun () ->
-        match Atomic.get popped with
-        | None ->
-            Stack.try_pop s = Some 42
-        | Some 42 ->
-            Stack.try_pop s = None
-        | _ ->
-            false)))
-;;
+module Racy = Tests (Lockfree_stack.Make (Racy_cas) (Backoff.No_backoff))
 
-(* ------------------------------------------------------------------ *)
-(* Test 3 : two concurrent pops                                       *)
-(* ------------------------------------------------------------------ *)
-
-let two_pops () =
-  Atomic.trace (fun () ->
-    let s = Stack.create () in
-
-    Stack.push s 1;
-    Stack.push s 2;
-
-    let r1 = Atomic.make None in
-    let r2 = Atomic.make None in
-
-    Atomic.spawn (fun () -> Atomic.set r1 (Stack.try_pop s));
-
-    Atomic.spawn (fun () -> Atomic.set r2 (Stack.try_pop s));
-
-    Atomic.final (fun () ->
-      Atomic.check (fun () ->
-        match Atomic.get r1, Atomic.get r2 with
-        | Some a, Some b ->
-            List.sort compare [ a; b ] = [ 1; 2 ]
-            && Stack.try_pop s = None
-        | _ ->
-            false)))
-;;
-
-(* ------------------------------------------------------------------ *)
-(* Test 4 : conservation property                                     *)
-(* ------------------------------------------------------------------ *)
-
-let conservation () =
-  Atomic.trace (fun () ->
-    let s = Stack.create () in
-
-    let r1 = Atomic.make None in
-    let r2 = Atomic.make None in
-
-    Atomic.spawn (fun () -> Stack.push s 1);
-    Atomic.spawn (fun () -> Stack.push s 2);
-    Atomic.spawn (fun () -> Atomic.set r1 (Stack.try_pop s));
-    Atomic.spawn (fun () -> Atomic.set r2 (Stack.try_pop s));
-
-    Atomic.final (fun () ->
-      Atomic.check (fun () ->
-        let elems = ref [] in
-
-        (match Atomic.get r1 with
-         | Some x -> elems := x :: !elems
-         | None -> ());
-
-        (match Atomic.get r2 with
-         | Some x -> elems := x :: !elems
-         | None -> ());
-
-        (match Stack.try_pop s with
-         | Some x -> elems := x :: !elems
-         | None -> ());
-
-        (match Stack.try_pop s with
-         | Some x -> elems := x :: !elems
-         | None -> ());
-
-        List.sort compare !elems = [ 1; 2 ])))
-;;
-
-(* ------------------------------------------------------------------ *)
-(* Test 5 : LIFO property                                             *)
-(* ------------------------------------------------------------------ *)
-
-(* Not run: has no Atomic.spawn calls, so dscheck's scheduler has nothing
-   to explore ("no enabled processes"). Kept for reference. *)
-let[@warning "-32"] lifo_property () =
-  Atomic.trace (fun () ->
-    let s = Stack.create () in
-
-    Stack.push s 1;
-    Stack.push s 2;
-    Stack.push s 3;
-
-    Atomic.final (fun () ->
-      Atomic.check (fun () ->
-        Stack.pop s = 3
-        && Stack.pop s = 2
-        && Stack.pop s = 1)))
-;;
-
-(* ------------------------------------------------------------------ *)
-(* Test 6 : empty stack                                               *)
-(* ------------------------------------------------------------------ *)
-
-(* Not run: has no Atomic.spawn calls, so dscheck's scheduler has nothing
-   to explore ("no enabled processes"). Kept for reference. *)
-let[@warning "-32"] empty_stack () =
-  Atomic.trace (fun () ->
-    let s = Stack.create () in
-
-    Atomic.final (fun () ->
-      Atomic.check (fun () ->
-        Stack.try_pop s = None)))
-;;
-
-(* ------------------------------------------------------------------ *)
-(* Runner: dscheck's Atomic.check already raises Assert_failure and    *)
-(* prints the offending interleaving when a check fails, so no test    *)
-(* framework is needed - just run each trace and report success.      *)
-(* ------------------------------------------------------------------ *)
+let expect_violation name test =
+  match test () with
+  | () -> failwith (name ^ ": DSCheck found no violation in a buggy stack")
+  | exception Assert_failure _ ->
+    print_endline (name ^ ": violation found, as expected")
 
 let () =
-  two_pushes ();
-  print_endline "two-pushes test passed!";
-
-  push_and_pop ();
-  print_endline "push-pop test passed!";
-
-  two_pops ();
-  print_endline "two-pops test passed!";
-
-  conservation ();
-  print_endline "conservation test passed!";
-
-  (* lifo_property and empty_stack are excluded: neither calls Atomic.spawn,
-     and dscheck's scheduler requires at least one spawned process to explore. *)
-
+  T.two_pushes ();
+  print_endline "Two pushes test passed!";
+  T.push_and_pop ();
+  print_endline "Push/pop race test passed!";
+  T.two_pops ();
+  print_endline "Two pops test passed!";
+  T.lifo ();
+  print_endline "LIFO test passed!";
+  T.conservation ();
+  print_endline "Conservation test passed!";
+  (* Run last: DSCheck's global state is not reset after a failed check. *)
+  expect_violation "Racy CAS, two pushes" Racy.two_pushes;
   print_endline "All dscheck_lockfree_stack tests passed!"
